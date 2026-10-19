@@ -1,0 +1,585 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import {
+  Building2,
+  Receipt,
+  PencilLine,
+  Plus,
+  Trash2,
+} from "lucide-react";
+import { useApi } from "@/hooks/useApi";
+import { useConfirmAction } from "@/hooks/useConfirmAction";
+import {
+  createVendor,
+  createVendorExpense,
+  deleteVendor,
+  listVendorExpenses,
+  listVendors,
+} from "@/lib/api/endpoints";
+import type { Vendor, VendorExpense } from "@/lib/api/normalize";
+import type { PaginationMeta } from "@/lib/api/types";
+import type { RawVendorType } from "@/lib/api/endpoints";
+import { errorMessage } from "@/lib/api/types";
+import PageHeader from "@/components/ui/PageHeader";
+import Card from "@/components/ui/Card";
+import Button from "@/components/ui/Button";
+import Modal from "@/components/ui/Modal";
+import Input from "@/components/ui/Input";
+import AppSelect from "@/components/ui/AppSelect";
+import DatePicker from "@/components/ui/DatePicker";
+import StatusBadge from "@/components/booking/StatusBadge";
+import EmptyState from "@/components/ui/EmptyState";
+import ErrorState from "@/components/ui/ErrorState";
+import TableSkeleton from "@/components/ui/TableSkeleton";
+import Pagination from "@/components/ui/Pagination";
+import ConfirmDialog from "@/components/ui/ConfirmDialog";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs";
+import { formatBDT, formatDate } from "@/lib/format";
+
+const TYPE_LABEL: Record<string, string> = {
+  HOTEL: "Hotel",
+  AIRLINE: "Airline",
+  TRANSPORT: "Transport",
+  VISA: "Visa",
+  OTHER: "Other",
+};
+
+const VENDOR_TYPE_OPTIONS = [
+  { value: "HOTEL", label: "Hotel" },
+  { value: "AIRLINE", label: "Airline" },
+  { value: "TRANSPORT", label: "Transport" },
+  { value: "VISA", label: "Visa" },
+  { value: "OTHER", label: "Other" },
+];
+
+const EXPENSE_TYPE_OPTIONS = [
+  { value: "HOTEL", label: "Hotel" },
+  { value: "AIRLINE", label: "Airline" },
+  { value: "TRANSPORT", label: "Transport" },
+  { value: "VISA", label: "Visa" },
+  { value: "OTHER", label: "Other" },
+];
+
+const VENDOR_TABLE_COLUMNS = 5;
+const VENDOR_TABLE_WIDTHS = [
+  "w-44", // Name
+  "w-24", // Type
+  "w-44", // Contact
+  "w-20", // Status
+  "w-20", // Actions
+];
+
+const EXPENSE_TABLE_COLUMNS = 6;
+const EXPENSE_TABLE_WIDTHS = [
+  "w-24", // Date
+  "w-32", // Vendor
+  "w-24", // Type
+  "w-24", // Amount
+  "w-20", // BDT
+  "w-20", // Booking
+];
+
+type TabValue = "vendors" | "expenses";
+
+export default function VendorsPage() {
+  const [expensesPage, setExpensesPage] = useState(1);
+  const [tab, setTab] = useState<TabValue>("vendors");
+
+  const [showVendor, setShowVendor] = useState(false);
+  const [showExpense, setShowExpense] = useState(false);
+
+  // Only fetch the data the user is actually viewing. The tabs above toggle
+  // `tab` synchronously; fetching both at mount wastes a request on first
+  // load and after every refetch of the visible tab.
+  const vendors = useApi(
+    () => listVendors({ limit: 50 }),
+    [],
+    { enabled: tab === "vendors" },
+  );
+  const expenses = useApi(
+    () => listVendorExpenses({ page: expensesPage, limit: 20 }),
+    [expensesPage],
+    { enabled: tab === "expenses" },
+  );
+
+  return (
+    <>
+      <PageHeader
+        title="Vendors & expenses"
+        description="Manage suppliers (hotels, airlines, transport, visa agents) and the costs you incur against them."
+        actions={
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setShowExpense(true)}
+            >
+              <PencilLine className="h-4 w-4" aria-hidden />
+              Log expense
+            </Button>
+            <Button size="sm" onClick={() => setShowVendor(true)}>
+              <Plus className="h-4 w-4" aria-hidden />
+              New vendor
+            </Button>
+          </div>
+        }
+      />
+
+      <Tabs
+        value={tab}
+        onValueChange={(v) => setTab(v as TabValue)}
+        className="mt-4"
+      >
+        <TabsList>
+          <TabsTrigger value="vendors" icon={<Building2 className="h-4 w-4" />}>
+            Vendors
+          </TabsTrigger>
+          <TabsTrigger value="expenses" icon={<Receipt className="h-4 w-4" />}>
+            Expenses
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="vendors">
+          <VendorsList
+            loading={vendors.loading}
+            error={vendors.error}
+            onRefetch={vendors.refetch}
+            vendors={vendors.data?.data ?? []}
+          />
+        </TabsContent>
+
+        <TabsContent value="expenses">
+          <ExpensesList
+            loading={expenses.loading}
+            error={expenses.error}
+            onRefetch={expenses.refetch}
+            expenses={expenses.data?.data ?? []}
+            meta={expenses.data?.meta ?? null}
+            setPage={setExpensesPage}
+          />
+        </TabsContent>
+      </Tabs>
+
+      <NewVendorModal
+        open={showVendor}
+        onClose={() => setShowVendor(false)}
+        onCreated={() => vendors.refetch()}
+      />
+      <NewExpenseModal
+        open={showExpense}
+        onClose={() => setShowExpense(false)}
+        vendors={vendors.data?.data ?? []}
+        onCreated={() => expenses.refetch()}
+      />
+    </>
+  );
+}
+
+function VendorsList({
+  loading,
+  error,
+  onRefetch,
+  vendors,
+}: {
+  loading: boolean;
+  error: string | null;
+  onRefetch: () => void;
+  vendors: Vendor[];
+}) {
+  const del = useConfirmAction<Vendor>({
+    title: (v) => `Delete vendor "${v.name}"?`,
+    description:
+      "This action can't be undone. Existing vendor expenses stay in the audit log but the vendor will be removed from the supplier list.",
+    confirmText: "Delete",
+    variant: "danger",
+    successTitle: (v) => `Deleted ${v.name}`,
+    errorTitle: "Couldn't delete vendor",
+    action: (v) => deleteVendor(v.id),
+    onSuccess: onRefetch,
+  });
+
+  return (
+    <div className="mt-2">
+      {loading ? (
+        <TableSkeleton
+          columns={VENDOR_TABLE_COLUMNS}
+          columnWidths={VENDOR_TABLE_WIDTHS}
+          rows={6}
+        />
+      ) : error ? (
+        <ErrorState message={error} retry={onRefetch} />
+      ) : vendors.length === 0 ? (
+        <EmptyState
+          title="No vendors yet"
+          description="Add a hotel, airline, or transport vendor to start logging expenses."
+        />
+      ) : (
+        <Card className="overflow-hidden p-0">
+          <table className="w-full text-default">
+            <thead className="bg-base text-meta uppercase tracking-[0.04em] text-text-subtle">
+              <tr>
+                <th className="px-4 py-3 text-left">Name</th>
+                <th className="px-4 py-3 text-left">Type</th>
+                <th className="px-4 py-3 text-left">Contact</th>
+                <th className="px-4 py-3 text-left">Status</th>
+                <th className="px-4 py-3 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {vendors.map((v) => (
+                <tr key={v.id}>
+                  <td className="px-4 py-3 font-medium text-text">{v.name}</td>
+                  <td className="px-4 py-3 text-text-muted">
+                    {TYPE_LABEL[v.type] ?? v.type}
+                  </td>
+                  <td className="px-4 py-3 text-text-muted">
+                    {v.contactInfo ?? "—"}
+                  </td>
+                  <td className="px-4 py-3">
+                    <StatusBadge status={v.status} />
+                  </td>
+                  <td className="px-4 py-3 text-right">
+                    <button
+                      onClick={() => del.confirm(v)}
+                      disabled={del.busy}
+                      className="inline-flex items-center gap-1 text-meta font-medium text-danger hover:underline disabled:opacity-50"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                      {del.busy ? "Deleting…" : "Delete"}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      )}
+      <ConfirmDialog {...del.dialogProps} />
+    </div>
+  );
+}
+
+function ExpensesList({
+  loading,
+  error,
+  onRefetch,
+  expenses,
+  meta,
+  setPage,
+}: {
+  loading: boolean;
+  error: string | null;
+  onRefetch: () => void;
+  expenses: VendorExpense[];
+  meta: PaginationMeta | null;
+  setPage: (p: number) => void;
+}) {
+  return (
+    <div className="mt-2">
+      {loading ? (
+        <TableSkeleton
+          columns={EXPENSE_TABLE_COLUMNS}
+          columnWidths={EXPENSE_TABLE_WIDTHS}
+          rows={8}
+        />
+      ) : error ? (
+        <ErrorState message={error} retry={onRefetch} />
+      ) : expenses.length === 0 ? (
+        <EmptyState
+          title="No expenses logged"
+          description="Once you log a vendor cost, it'll show up here."
+        />
+      ) : (
+        <>
+          <Card className="overflow-hidden p-0">
+            <table className="w-full text-default">
+              <thead className="bg-base text-meta uppercase tracking-[0.04em] text-text-subtle">
+                <tr>
+                  <th className="px-4 py-3 text-left">Date</th>
+                  <th className="px-4 py-3 text-left">Vendor</th>
+                  <th className="px-4 py-3 text-left">Type</th>
+                  <th className="px-4 py-3 text-right">Amount</th>
+                  <th className="px-4 py-3 text-right">BDT</th>
+                  <th className="px-4 py-3 text-left">Booking</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {expenses.map((e) => (
+                  <tr key={e.id}>
+                    <td className="px-4 py-3 text-text-muted">
+                      {formatDate(e.expenseDate)}
+                    </td>
+                    <td className="px-4 py-3 text-text">
+                      {e.vendor?.name ?? e.vendorId.slice(0, 8)}
+                    </td>
+                    <td className="px-4 py-3 text-text-muted">
+                      {TYPE_LABEL[e.expenseType] ?? e.expenseType}
+                    </td>
+                    <td className="px-4 py-3 text-right text-text">
+                      {e.amount} {e.currency}
+                    </td>
+                    <td className="px-4 py-3 text-right font-semibold text-text">
+                      {formatBDT(e.amountBdt)}
+                    </td>
+                    <td className="px-4 py-3 font-mono text-meta text-text-muted">
+                      {e.bookingId ? e.bookingId.slice(0, 8) : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </Card>
+          {meta && (
+            <div className="mt-6">
+              <Pagination
+                page={meta.page}
+                totalPages={meta.totalPages}
+                onPageChange={setPage}
+              />
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function NewVendorModal({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [type, setType] = useState<RawVendorType>("HOTEL");
+  const [contactInfo, setContactInfo] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleSubmit() {
+    if (!name.trim()) {
+      setError("Name is required.");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      await createVendor({
+        name: name.trim(),
+        type,
+        contact_info: contactInfo.trim() || undefined,
+      });
+      setName("");
+      setContactInfo("");
+      onCreated();
+      onClose();
+    } catch (err) {
+      setError(errorMessage(err) ?? "Couldn't create vendor.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Modal open={open} onClose={onClose} title="New vendor">
+      <div className="space-y-4">
+        <Input
+          id="vendor-name"
+          label="Name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+        <AppSelect
+          label="Type"
+          value={type}
+          onValueChange={(v) => setType(v as RawVendorType)}
+          options={VENDOR_TYPE_OPTIONS}
+        />
+        <Input
+          id="vendor-contact"
+          label="Contact info (optional)"
+          value={contactInfo}
+          onChange={(e) => setContactInfo(e.target.value)}
+          placeholder="Email / phone / website"
+        />
+        {error && <p className="text-default text-danger">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={handleSubmit} loading={submitting}>
+            Create
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function NewExpenseModal({
+  open,
+  onClose,
+  vendors,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  vendors: Array<{ id: string; name: string }>;
+  onCreated: () => void;
+}) {
+  const [vendorId, setVendorId] = useState("");
+  const [expenseType, setExpenseType] = useState<RawVendorType>("HOTEL");
+  const [amount, setAmount] = useState("");
+  const [currency, setCurrency] = useState("BDT");
+  const [exchangeRate, setExchangeRate] = useState("1");
+  const [expenseDate, setExpenseDate] = useState("");
+  const [bookingId, setBookingId] = useState("");
+  const [notes, setNotes] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Memoize the option list — keeps object identity stable while the user
+  // types in unrelated fields, avoiding <Select> re-render churn.
+  const vendorOptions = useMemo(
+    () => vendors.map((v) => ({ value: v.id, label: v.name })),
+    [vendors],
+  );
+
+  async function handleSubmit() {
+    if (!vendorId) {
+      setError("Pick a vendor.");
+      return;
+    }
+    if (!expenseDate) {
+      setError("Expense date is required.");
+      return;
+    }
+    const amountNum = parseFloat(amount);
+    const rate = parseFloat(exchangeRate);
+    if (!Number.isFinite(amountNum) || amountNum <= 0) {
+      setError("Amount must be greater than 0.");
+      return;
+    }
+    if (!Number.isFinite(rate) || rate <= 0) {
+      setError("Exchange rate must be greater than 0.");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      await createVendorExpense({
+        vendor_id: vendorId,
+        expense_type: expenseType,
+        amount: amountNum,
+        currency: currency.trim() || "BDT",
+        exchange_rate: rate,
+        expense_date: expenseDate,
+        booking_id: bookingId.trim() || undefined,
+        notes: notes.trim() || undefined,
+      });
+      setAmount("");
+      setNotes("");
+      setBookingId("");
+      onCreated();
+      onClose();
+    } catch (err) {
+      setError(errorMessage(err) ?? "Couldn't log the expense.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Modal open={open} onClose={onClose} title="Log vendor expense">
+      <div className="space-y-4">
+        <AppSelect
+          label="Vendor"
+          value={vendorId}
+          onValueChange={setVendorId}
+          options={[
+            { value: "", label: "Select vendor…" },
+            ...vendorOptions,
+          ]}
+        />
+        <div className="grid grid-cols-2 gap-3">
+          <Input
+            id="expense-amount"
+            type="number"
+            label="Amount"
+            value={amount}
+            min={0}
+            step="0.01"
+            onChange={(e) => setAmount(e.target.value)}
+          />
+          <Input
+            id="expense-currency"
+            label="Currency"
+            value={currency}
+            onChange={(e) => setCurrency(e.target.value.toUpperCase())}
+          />
+          <Input
+            id="expense-rate"
+            type="number"
+            label="Exchange rate"
+            value={exchangeRate}
+            min={0}
+            step="0.0001"
+            onChange={(e) => setExchangeRate(e.target.value)}
+            hint="To BDT"
+          />
+          <AppSelect
+            label="Expense type"
+            value={expenseType}
+            onValueChange={(v) => setExpenseType(v as RawVendorType)}
+            options={EXPENSE_TYPE_OPTIONS}
+          />
+          <DatePicker
+            label="Date"
+            value={expenseDate}
+            onChange={setExpenseDate}
+          />
+          <Input
+            id="expense-booking"
+            label="Booking ID (optional)"
+            value={bookingId}
+            onChange={(e) => setBookingId(e.target.value)}
+            placeholder="UUID"
+          />
+        </div>
+        <div>
+          <label
+            htmlFor="expense-notes"
+            className="mb-1.5 block text-meta font-semibold uppercase tracking-[0.06em] text-text-muted"
+          >
+            Notes
+          </label>
+          <textarea
+            id="expense-notes"
+            rows={3}
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            className="w-full rounded-chip border border-border bg-card px-3.5 py-2.5 text-default text-text placeholder:text-text-subtle focus:border-emerald focus:outline-none transition-colors"
+          />
+        </div>
+        {error && <p className="text-default text-danger">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={handleSubmit} loading={submitting}>
+            Log expense
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
